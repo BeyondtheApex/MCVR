@@ -4,6 +4,7 @@
 #include "core/render/renderer.hpp"
 
 #include <cstring>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -434,7 +435,7 @@ void OpenXRContext::requestSessionStop() {
         return;
     }
 
-    if (frameStarted_) {
+    if (frameState_ == FRAME_LATCHED) {
         endFrame();
     }
 
@@ -500,7 +501,7 @@ void OpenXRContext::destroySessionResources() {
 
     sessionRunning_ = false;
     sessionState_ = XR_SESSION_STATE_UNKNOWN;
-    frameStarted_ = false;
+    frameState_ = FRAME_IDLE;
     viewsValid_ = false;
     destroyPending_ = false;
     visMaskVertices_[0].clear();
@@ -509,16 +510,33 @@ void OpenXRContext::destroySessionResources() {
     visMaskIndices_[1].clear();
 }
 
-bool OpenXRContext::beginFrame() {
-    if (!sessionRunning_) return false;
+void OpenXRContext::beginFrameRecording() {
+    frameState_ = FRAME_RECORDING;
+    viewsValid_ = false;  // Will be updated in latchPose
+    lastWaitFrameMs_ = 0.0f;
+    lastSwapchainWaitMs_ = 0.0f;
 
-    if (sessionState_ < XR_SESSION_STATE_READY || sessionState_ > XR_SESSION_STATE_FOCUSED) {
+    // Initialize XR frame state for upcoming latchPose() call
+    xrFrameState_ = {XR_TYPE_FRAME_STATE};
+}
+
+bool OpenXRContext::latchPose() {
+    // Consolidate session state validation
+    if (!sessionRunning_ || sessionState_ < XR_SESSION_STATE_READY || sessionState_ > XR_SESSION_STATE_FOCUSED) {
         return false;
     }
 
-    frameState_ = {XR_TYPE_FRAME_STATE};
+    if (frameState_ != FRAME_RECORDING) {
+        xrCerr() << "latchPose called without beginFrameRecording()" << std::endl;
+        return false;
+    }
+
+    // CRITICAL: This is where we call the blocking xrWaitFrame
     XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
-    XrResult r = xrWaitFrame(session_, &waitInfo, &frameState_);
+    auto waitFrameStart = std::chrono::high_resolution_clock::now();
+    XrResult r = xrWaitFrame(session_, &waitInfo, &xrFrameState_);
+    lastWaitFrameMs_ = std::chrono::duration<float, std::milli>(
+        std::chrono::high_resolution_clock::now() - waitFrameStart).count();
     if (XR_FAILED(r)) {
         xrCerr() << "xrWaitFrame failed" << std::endl;
         return false;
@@ -531,13 +549,13 @@ bool OpenXRContext::beginFrame() {
         return false;
     }
 
-    frameStarted_ = true;
+    frameState_ = FRAME_LATCHED;
 
-    // Locate views (head pose + per-eye FOV)
+    // Locate views (head pose + per-eye FOV) with latest timing
     viewsValid_ = false;
     XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
     locateInfo.viewConfigurationType = viewConfigType_;
-    locateInfo.displayTime = frameState_.predictedDisplayTime;
+    locateInfo.displayTime = xrFrameState_.predictedDisplayTime;
     locateInfo.space = appSpace_;
 
     XrViewState viewState{XR_TYPE_VIEW_STATE};
@@ -549,9 +567,9 @@ bool OpenXRContext::beginFrame() {
         viewsValid_ = true;
     }
 
-    // Sync controller input
+    // Sync controller input with latest timing
     if (inputInitialized_) {
-        input_.syncAndUpdate(session_, appSpace_, frameState_.predictedDisplayTime);
+        input_.syncAndUpdate(session_, appSpace_, xrFrameState_.predictedDisplayTime);
     }
 
     return true;
@@ -573,7 +591,10 @@ VkImage OpenXRContext::acquireSwapchainImage(uint32_t eye) {
 
     XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     waitInfo.timeout = XR_INFINITE_DURATION;
+    auto waitSwapchainStart = std::chrono::high_resolution_clock::now();
     r = xrWaitSwapchainImage(es.handle, &waitInfo);
+    lastSwapchainWaitMs_ += std::chrono::duration<float, std::milli>(
+        std::chrono::high_resolution_clock::now() - waitSwapchainStart).count();
     if (XR_FAILED(r)) {
         xrCerr() << "xrWaitSwapchainImage failed" << std::endl;
         return VK_NULL_HANDLE;
@@ -605,8 +626,8 @@ void OpenXRContext::releaseSwapchainImage(uint32_t eye) {
 }
 
 void OpenXRContext::endFrame() {
-    if (!frameStarted_) return;
-    frameStarted_ = false;
+    if (frameState_ != FRAME_LATCHED) return;
+    frameState_ = FRAME_IDLE;
 
     // Build projection views referencing each eye's swapchain
     for (uint32_t eye = 0; eye < 2; eye++) {
@@ -630,9 +651,9 @@ void OpenXRContext::endFrame() {
         reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projLayer)};
 
     XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
-    endInfo.displayTime = frameState_.predictedDisplayTime;
+    endInfo.displayTime = xrFrameState_.predictedDisplayTime;
     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    if (frameState_.shouldRender == XR_TRUE && viewsValid_) {
+    if (xrFrameState_.shouldRender == XR_TRUE && viewsValid_) {
         endInfo.layerCount = 1;
         endInfo.layers = layers;
     } else {

@@ -22,8 +22,13 @@ class WorldPrepareContext;
 struct RayTracingPushConstant {
     int numRayBounces;
     int useJitter;
-    uint32_t eyeIndex;
 };
+
+// Descriptor set and binding constants
+constexpr uint32_t TEXTURES_SET = 0;
+constexpr uint32_t ACCELERATION_SET = 1;
+constexpr uint32_t UNIFORMS_SET = 2;
+constexpr uint32_t OUTPUT_IMAGES_SET = 3;
 
 class RayTracingModule : public WorldModule, public SharedObject<RayTracingModule> {
     friend RayTracingModuleContext;
@@ -108,8 +113,8 @@ class RayTracingModule : public WorldModule, public SharedObject<RayTracingModul
     std::shared_ptr<vk::Shader> worldLightMapVertShader_;
     std::shared_ptr<vk::Shader> worldLightMapFragShader_;
 
-    // rayTracingDescriptorTables_[frameIndex][eyeIndex]
-    std::vector<std::vector<std::shared_ptr<vk::DescriptorTable>>> rayTracingDescriptorTables_;
+    // rayTracingDescriptorTables_[frameIndex] - unified descriptor table for 3D dispatch
+    std::vector<std::shared_ptr<vk::DescriptorTable>> rayTracingDescriptorTables_;
     std::shared_ptr<vk::RayTracingPipeline> rayTracingPipeline_;
     std::vector<std::shared_ptr<vk::SBT>> sbts_;
 
@@ -149,8 +154,8 @@ struct RayTracingModuleContext : public WorldModuleContext, SharedObject<RayTrac
     // none
 
     // ray tracing
-    // rayTracingDescriptorTables[eyeIndex]
-    std::vector<std::shared_ptr<vk::DescriptorTable>> rayTracingDescriptorTables;
+    // unified descriptor table for 3D dispatch
+    std::shared_ptr<vk::DescriptorTable> rayTracingDescriptorTable;
     std::shared_ptr<vk::SBT> sbt;
 
     // output

@@ -215,16 +215,17 @@ JNIEXPORT void JNICALL Java_com_radiance_client_proxy_vulkan_VRProxy_nativeStopV
 
 JNIEXPORT jfloatArray JNICALL Java_com_radiance_client_proxy_vulkan_VRProxy_nativeGetPerformanceStats(
     JNIEnv *env, jclass) {
-    // Returns [gpuFrameTimeMs, cpuFrameTimeMs, compositorTargetMs, fps, droppedFrames, headroom] = 6 floats
-    jfloatArray result = env->NewFloatArray(6);
+    // Returns [gpuFrameTimeMs, cpuFrameTimeMs, cpuWorkMs, cpuWaitMs, compositorTargetMs, fps, droppedFrames, headroom] = 8 floats
+    jfloatArray result = env->NewFloatArray(8);
     if (!Renderer::is_initialized()) return result;
     const auto &stats = Renderer::instance().vrSystem().perfStats;
-    float data[6] = {
+    float data[8] = {
         stats.gpuFrameTimeMs, stats.cpuFrameTimeMs,
+        stats.cpuWorkMs, stats.cpuWaitMs,
         stats.compositorTargetMs, stats.fps,
         static_cast<float>(stats.droppedFrames), stats.headroom
     };
-    env->SetFloatArrayRegion(result, 0, 6, data);
+    env->SetFloatArrayRegion(result, 0, 8, data);
     return result;
 }
 

@@ -128,7 +128,6 @@ class Framework : public SharedObject<Framework> {
     std::vector<std::shared_ptr<vk::CommandBuffer>> uploadCommandBuffers_;
     std::vector<std::shared_ptr<vk::CommandBuffer>> overlayCommandBuffers_;
     std::vector<std::shared_ptr<vk::CommandBuffer>> worldCommandBuffers_;
-    std::vector<std::shared_ptr<vk::CommandBuffer>> fuseCommandBuffers_;
     std::shared_ptr<vk::CommandBuffer> worldAsyncCommandBuffer_;
 
     std::shared_ptr<Pipeline> pipeline_;

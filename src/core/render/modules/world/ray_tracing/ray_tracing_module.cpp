@@ -148,11 +148,10 @@ void RayTracingModule::bindTexture(std::shared_ptr<vk::Sampler> sampler,
 
     uint32_t size = framework->swapchain()->imageCount();
     for (int i = 0; i < size; i++) {
-        for (uint32_t eye = 0; eye < eyeCount_; eye++) {
-            if (rayTracingDescriptorTables_[i][eye] != nullptr)
-                rayTracingDescriptorTables_[i][eye]->bindSamplerImage(sampler, image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                                                      0, 0, index);
-        }
+        // Bind to unified descriptor table (no per-eye iteration)
+        if (rayTracingDescriptorTables_[i] != nullptr)
+            rayTracingDescriptorTables_[i]->bindSamplerImage(sampler, image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                                              TEXTURES_SET, 0, index);
     }
 }
 
@@ -165,9 +164,11 @@ void RayTracingModule::createVisibilityMaskImage() {
 
     uint32_t w = hdrNoisyOutputImages_[0]->width();
     uint32_t h = hdrNoisyOutputImages_[0]->height();
+    // Each row is packed into ceil(w/32) uint32 words (1 bit per pixel)
+    uint32_t wPacked = (w + 31) / 32;
 
-    // Allocate pixel buffer: all visible (0xFF) initially
-    std::vector<uint8_t> pixels(static_cast<size_t>(w) * h * eyeCount_, 0xFF);
+    // Allocate bitmask buffer: all visible (all bits set) initially
+    std::vector<uint32_t> masks(static_cast<size_t>(wPacked) * h * eyeCount_, 0xFFFFFFFFu);
 
     // Fill hidden triangles only when running the stereo XR path.
     bool useVisibilityMask = false;
@@ -195,7 +196,7 @@ void RayTracingModule::createVisibilityMaskImage() {
             float rangeY = maxVy - minVy;
             if (rangeX < 1e-6f || rangeY < 1e-6f) continue;
 
-            uint8_t *layer = pixels.data() + static_cast<size_t>(w) * h * eye;
+            uint32_t *layer = masks.data() + static_cast<size_t>(wPacked) * h * eye;
 
             for (size_t t = 0; t + 2 < indices.size(); t += 3) {
                 // Map from tangent-angle space to pixel coords using vertex bounding box
@@ -227,7 +228,7 @@ void RayTracingModule::createVisibilityMaskImage() {
                         float b = ((p2.y - p0.y) * (px - p2.x) + (p0.x - p2.x) * (py - p2.y)) * invDenom;
                         float c = 1.0f - a - b;
                         if (a >= 0.0f && b >= 0.0f && c >= 0.0f) {
-                            layer[y * w + x] = 0; // hidden
+                            layer[y * wPacked + x / 32] &= ~(1u << (x % 32u)); // clear bit = hidden
                         }
                     }
                 }
@@ -235,14 +236,14 @@ void RayTracingModule::createVisibilityMaskImage() {
         }
     }
 
-    // Create device image
+    // Create device image: width=wPacked (one uint32 per 32 pixels), R32_UINT
     visMaskImage_ = vk::DeviceLocalImage::create(
-        device, vma, true, w, h, eyeCount_, VK_FORMAT_R8_UNORM,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        device, vma, true, wPacked, h, eyeCount_, VK_FORMAT_R32_UINT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     if (eyeCount_ > 1) visMaskImage_->createPerLayerViews();
 
-    // Upload pixels to staging buffer
-    visMaskImage_->uploadToStagingBuffer(pixels.data());
+    // Upload bitmask data to staging buffer
+    visMaskImage_->uploadToStagingBuffer(masks.data());
 
     // One-shot command buffer: transition → copy → transition
     auto physDev = framework->physicalDevice();
@@ -293,16 +294,15 @@ void RayTracingModule::initDescriptorTables() {
     rayTracingDescriptorTables_.resize(size);
 
     for (int i = 0; i < size; i++) {
-        rayTracingDescriptorTables_[i].resize(eyeCount_);
-        for (uint32_t eye = 0; eye < eyeCount_; eye++) {
-        rayTracingDescriptorTables_[i][eye] =
+        // Create unified descriptor table for 3D dispatch (no per-eye tables)
+        rayTracingDescriptorTables_[i] =
             vk::DescriptorTableBuilder{}
                 .beginDescriptorLayoutSet() // set 0
                 .beginDescriptorLayoutSetBinding()
                 .defineDescriptorLayoutSetBinding({
                     .binding = 0,
                     .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                    .descriptorCount = 4096, // a very big number
+                    .descriptorCount = 512, // Reasonable texture limit (was 4096)
                     .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
                                   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -536,7 +536,6 @@ void RayTracingModule::initDescriptorTables() {
                     .size = sizeof(RayTracingPushConstant),
                 })
                 .build(framework->device());
-        }
     }
 }
 
@@ -546,32 +545,31 @@ void RayTracingModule::initImages() {
     uint32_t size = framework->swapchain()->imageCount();
 
     for (int i = 0; i < size; i++) {
-        for (uint32_t eye = 0; eye < eyeCount_; eye++) {
-            auto& dt = rayTracingDescriptorTables_[i][eye];
+        // Unified descriptor table for 3D dispatch
+        auto& dt = rayTracingDescriptorTables_[i];
 
-            dt->bindSamplerImageForShader(atmosphere_->atmLUTImageSampler_,
-                                          atmosphere_->atmLUTImage_, 0, 1);
-            dt->bindSamplerImageForShader(atmosphere_->atmCubeMapImageSamplers_[i],
-                                          atmosphere_->atmCubeMapImages_[i], 0, 2, 7);
+        dt->bindSamplerImageForShader(atmosphere_->atmLUTImageSampler_,
+                                      atmosphere_->atmLUTImage_, TEXTURES_SET, 1);
+        dt->bindSamplerImageForShader(atmosphere_->atmCubeMapImageSamplers_[i],
+                                      atmosphere_->atmCubeMapImages_[i], TEXTURES_SET, 2, 7);
 
-            // set 3: bind per-layer views for output images
-            uint32_t viewIndex = (eyeCount_ > 1) ? (1 + eye) : 0;
-            dt->bindImage(hdrNoisyOutputImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 0, viewIndex);
-            dt->bindImage(diffuseAlbedoImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 1, viewIndex);
-            dt->bindImage(specularAlbedoImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 2, viewIndex);
-            dt->bindImage(normalRoughnessImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 3, viewIndex);
-            dt->bindImage(motionVectorImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 4, viewIndex);
-            dt->bindImage(linearDepthImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 5, viewIndex);
-            dt->bindImage(specularHitDepthImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 6, viewIndex);
-            dt->bindImage(firstHitDepthImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 7, viewIndex);
-            dt->bindImage(firstHitDiffuseDirectLightImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 8, viewIndex);
-            dt->bindImage(firstHitDiffuseIndirectLightImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 9, viewIndex);
-            dt->bindImage(firstHitSpecularImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 10, viewIndex);
-            dt->bindImage(firstHitClearImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 11, viewIndex);
-            dt->bindImage(firstHitBaseEmissionImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 12, viewIndex);
-            dt->bindImage(directLightDepthImages_[i], VK_IMAGE_LAYOUT_GENERAL, 3, 13, viewIndex);
-            dt->bindImage(visMaskImage_, VK_IMAGE_LAYOUT_GENERAL, 3, 14, viewIndex);
-        }
+        // set 3: bind full image array views for 3D dispatch
+        // In 3D dispatch, shader will use gl_LaunchIDEXT.z to select the layer
+        dt->bindImage(hdrNoisyOutputImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 0, 0);
+        dt->bindImage(diffuseAlbedoImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 1, 0);
+        dt->bindImage(specularAlbedoImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 2, 0);
+        dt->bindImage(normalRoughnessImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 3, 0);
+        dt->bindImage(motionVectorImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 4, 0);
+        dt->bindImage(linearDepthImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 5, 0);
+        dt->bindImage(specularHitDepthImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 6, 0);
+        dt->bindImage(firstHitDepthImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 7, 0);
+        dt->bindImage(firstHitDiffuseDirectLightImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 8, 0);
+        dt->bindImage(firstHitDiffuseIndirectLightImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 9, 0);
+        dt->bindImage(firstHitSpecularImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 10, 0);
+        dt->bindImage(firstHitClearImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 11, 0);
+        dt->bindImage(firstHitBaseEmissionImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 12, 0);
+        dt->bindImage(directLightDepthImages_[i], VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 13, 0);
+        dt->bindImage(visMaskImage_, VK_IMAGE_LAYOUT_GENERAL, OUTPUT_IMAGES_SET, 14, 0);
     }
 }
 
@@ -664,7 +662,7 @@ void RayTracingModule::initPipeline() {
             .defineShaderGroup(VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR, VK_SHADER_UNUSED_KHR, 16, 17,
                                VK_SHADER_UNUSED_KHR) // end gateway
             .endShaderGroup()
-            .definePipelineLayout(rayTracingDescriptorTables_[0][0])
+            .definePipelineLayout(rayTracingDescriptorTables_[0])
             .build(device);
 }
 
@@ -683,7 +681,7 @@ RayTracingModuleContext::RayTracingModuleContext(std::shared_ptr<FrameworkContex
                                                  std::shared_ptr<RayTracingModule> rayTracingModule)
     : WorldModuleContext(frameworkContext, worldPipelineContext),
       rayTracingModule(rayTracingModule),
-      rayTracingDescriptorTables(rayTracingModule->rayTracingDescriptorTables_[frameworkContext->frameIndex]),
+      rayTracingDescriptorTable(rayTracingModule->rayTracingDescriptorTables_[frameworkContext->frameIndex]),
       sbt(rayTracingModule->sbts_[frameworkContext->frameIndex]),
       hdrNoisyOutputImage(rayTracingModule->hdrNoisyOutputImages_[frameworkContext->frameIndex]),
       diffuseAlbedoImage(rayTracingModule->diffuseAlbedoImages_[frameworkContext->frameIndex]),
@@ -724,25 +722,23 @@ void RayTracingModuleContext::render3D(uint32_t eyeCount) {
 
     auto module = rayTracingModule.lock();
 
-    // Bind per-frame data to all eye descriptor tables
+    // Bind per-frame data to unified descriptor table
     auto buffers = Renderer::instance().buffers();
     auto worldBuffer = buffers->worldUniformBuffer();
 
-    for (uint32_t eye = 0; eye < eyeCount; eye++) {
-        auto& dt = rayTracingDescriptorTables[eye];
-        dt->bindAS(worldPrepareContext->tlas, 1, 0);
-        dt->bindBuffer(worldPrepareContext->blasOffsetsBuffer, 1, 1);
-        dt->bindBuffer(worldPrepareContext->vertexBufferAddr, 1, 2);
-        dt->bindBuffer(worldPrepareContext->indexBufferAddr, 1, 3);
-        dt->bindBuffer(worldPrepareContext->lastVertexBufferAddr, 1, 4);
-        dt->bindBuffer(worldPrepareContext->lastIndexBufferAddr, 1, 5);
-        dt->bindBuffer(worldPrepareContext->lastObjToWorldMat, 1, 6);
+    auto& dt = rayTracingDescriptorTable;
+    dt->bindAS(worldPrepareContext->tlas, ACCELERATION_SET, 0);
+    dt->bindBuffer(worldPrepareContext->blasOffsetsBuffer, ACCELERATION_SET, 1);
+    dt->bindBuffer(worldPrepareContext->vertexBufferAddr, ACCELERATION_SET, 2);
+    dt->bindBuffer(worldPrepareContext->indexBufferAddr, ACCELERATION_SET, 3);
+    dt->bindBuffer(worldPrepareContext->lastVertexBufferAddr, ACCELERATION_SET, 4);
+    dt->bindBuffer(worldPrepareContext->lastIndexBufferAddr, ACCELERATION_SET, 5);
+    dt->bindBuffer(worldPrepareContext->lastObjToWorldMat, ACCELERATION_SET, 6);
 
-        dt->bindBuffer(buffers->textureMappingBuffer(), 1, 7);
-        dt->bindBuffer(worldBuffer, 2, 0);
-        dt->bindBuffer(buffers->lastWorldUniformBuffer(), 2, 1);
-        dt->bindBuffer(buffers->skyUniformBuffer(), 2, 2);
-    }
+    dt->bindBuffer(buffers->textureMappingBuffer(), ACCELERATION_SET, 7);
+    dt->bindBuffer(worldBuffer, UNIFORMS_SET, 0);
+    dt->bindBuffer(buffers->lastWorldUniformBuffer(), UNIFORMS_SET, 1);
+    dt->bindBuffer(buffers->skyUniformBuffer(), UNIFORMS_SET, 2);
 
     auto chooseSrc = [](VkImageLayout oldLayout, VkPipelineStageFlags2 fallbackStage, VkAccessFlags2 fallbackAccess,
                         VkPipelineStageFlags2 &outStage, VkAccessFlags2 &outAccess) {
@@ -795,22 +791,23 @@ void RayTracingModuleContext::render3D(uint32_t eyeCount) {
 
     if (!barriers.empty()) { worldCommandBuffer->barriersBufferImage({}, barriers); }
 
-    // Per-eye dispatch loop: pre-bound descriptor sets, push constant with eyeIndex
-    for (uint32_t eye = 0; eye < eyeCount; eye++) {
-        RayTracingPushConstant pc{};
-        pc.numRayBounces = static_cast<int>(module->numRayBounces_);
-        pc.useJitter = module->useJitter_ ? 1 : 0;
-        pc.eyeIndex = eye;
+    // 3D DISPATCH
+    // Single 3D dispatch instead of per-eye loop to eliminate:
 
-        vkCmdPushConstants(worldCommandBuffer->vkCommandBuffer(),
-                           rayTracingDescriptorTables[eye]->vkPipelineLayout(),
-                           VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
-                               VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
-                               VK_SHADER_STAGE_INTERSECTION_BIT_KHR,
-                           0, sizeof(RayTracingPushConstant), &pc);
+    RayTracingPushConstant pc{};
+    pc.numRayBounces = static_cast<int>(module->numRayBounces_);
+    pc.useJitter = module->useJitter_ ? 1 : 0;
+    // eyeIndex is determined by gl_LaunchIDEXT.z in 3D dispatch mode
 
-        worldCommandBuffer->bindDescriptorTable(rayTracingDescriptorTables[eye], VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR)
-            ->bindRTPipeline(module->rayTracingPipeline_)
-            ->raytracing(sbt, hdrNoisyOutputImage->width(), hdrNoisyOutputImage->height(), 1);
-    }
+    vkCmdPushConstants(worldCommandBuffer->vkCommandBuffer(),
+                       rayTracingDescriptorTable->vkPipelineLayout(),
+                       VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
+                           VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
+                           VK_SHADER_STAGE_INTERSECTION_BIT_KHR,
+                       0, sizeof(RayTracingPushConstant), &pc);
+
+    // Single descriptor table bind and single 3D dispatch
+    worldCommandBuffer->bindDescriptorTable(rayTracingDescriptorTable, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR)
+        ->bindRTPipeline(module->rayTracingPipeline_)
+        ->raytracing(sbt, hdrNoisyOutputImage->width(), hdrNoisyOutputImage->height(), eyeCount);
 }

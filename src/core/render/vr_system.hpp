@@ -30,11 +30,13 @@ struct VRControllerState {
 // Performance statistics for monitoring/auto quality
 struct VRPerformanceStats {
     float gpuFrameTimeMs = 0.0f;
-    float cpuFrameTimeMs = 0.0f;
+    float cpuFrameTimeMs = 0.0f;  // full frame interval (cpuWorkMs + cpuWaitMs)
+    float cpuWorkMs = 0.0f;       // CPU active work time (excludes xrWaitFrame compositor pacing)
+    float cpuWaitMs = 0.0f;       // CPU time blocked in xrWaitFrame (compositor pacing / VSync wait)
     float compositorTargetMs = 0.0f;  // from XrFrameState.predictedDisplayPeriod
     float fps = 0.0f;
     uint32_t droppedFrames = 0;
-    float headroom = 0.0f;  // (targetMs - gpuTimeMs) / targetMs
+    float headroom = 0.0f;  // (targetMs - max(cpuWorkMs, gpuFrameTimeMs)) / targetMs
 };
 
 struct VREyeParams {

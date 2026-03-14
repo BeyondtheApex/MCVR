@@ -48,10 +48,19 @@ struct OpenXRContext {
     // Poll and process OpenXR events (session state transitions, etc.).
     void pollEvents();
 
-    // Begin an XR frame: xrWaitFrame + xrBeginFrame + xrLocateViews.
-    // Updates internal head pose and per-eye FOV/resolution.
-    // Returns true if the compositor wants us to render this frame.
-    bool beginFrame();
+    // --- PIPELINED FRAMING API ---
+    // Split frame operations into two phases for late-latch optimization:
+
+    // Phase 1: Begin frame recording without waiting for compositor.
+    // Allows CPU to start recording commands while GPU executes previous frame.
+    // This is called early in acquireContext().
+    void beginFrameRecording();
+
+    // Phase 2: Late-latch pose data just before submission.
+    // Calls xrWaitFrame + xrBeginFrame + xrLocateViews to get latest pose.
+    // Returns true if compositor wants us to render this frame.
+    // This is called in submitCommand() just before vkQueueSubmit.
+    bool latchPose();
 
     // Acquire the current XR swapchain image for the given eye.
     // Returns the VkImage to blit into. Must call releaseSwapchainImage() after blit.
@@ -76,7 +85,7 @@ struct OpenXRContext {
     uint32_t swapchainHeight() const { return eyeSwapchains_[0].height; }
 
     bool isSessionRunning() const { return sessionRunning_; }
-    bool shouldRender() const { return frameState_.shouldRender == XR_TRUE; }
+    bool shouldRender() const { return xrFrameState_.shouldRender == XR_TRUE; }
     XrSession session() const { return session_; }
 
     // Session control: keep runtime prepared but do not enter XR session
@@ -99,7 +108,9 @@ struct OpenXRContext {
     OpenXRInput &input() { return input_; }
 
     // Predicted display period in nanoseconds (for performance stats)
-    int64_t predictedDisplayPeriodNs() const { return frameState_.predictedDisplayPeriod; }
+    int64_t predictedDisplayPeriodNs() const { return xrFrameState_.predictedDisplayPeriod; }
+    float lastWaitFrameMs() const { return lastWaitFrameMs_; }
+    float lastSwapchainWaitMs() const { return lastSwapchainWaitMs_; }
 
     // Visibility mask vertices for an eye (empty if extension not supported)
     const std::vector<glm::vec2> &visibilityMaskVertices(uint32_t eye) const { return visMaskVertices_[eye]; }
@@ -130,11 +141,18 @@ private:
     std::array<EyeSwapchain, 2> eyeSwapchains_{};
 
     // Per-frame state
-    XrFrameState frameState_{XR_TYPE_FRAME_STATE};
+    XrFrameState xrFrameState_{XR_TYPE_FRAME_STATE};
     std::array<XrView, 2> views_{};
     std::array<XrCompositionLayerProjectionView, 2> projViews_{};
+    // Pipelined frame state
+    enum FrameState {
+        FRAME_IDLE,              // No frame operations
+        FRAME_RECORDING,         // Recording started, waiting for pose latch
+        FRAME_LATCHED,          // Pose latched, ready for submit
+        FRAME_STARTED           // XR frame started (legacy path)
+    };
+    FrameState frameState_ = FRAME_IDLE;
     bool viewsValid_ = false;
-    bool frameStarted_ = false;
 
     // Session state
     XrSessionState sessionState_ = XR_SESSION_STATE_UNKNOWN;
@@ -177,6 +195,10 @@ private:
     bool visMaskAvailable_ = false;
     std::array<std::vector<glm::vec2>, 2> visMaskVertices_;
     std::array<std::vector<uint32_t>, 2> visMaskIndices_;
+
+    // Timing diagnostics for CPU wait analysis.
+    float lastWaitFrameMs_ = 0.0f;
+    float lastSwapchainWaitMs_ = 0.0f;
 };
 
 #endif // MCVR_ENABLE_OPENXR
